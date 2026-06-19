@@ -1,18 +1,19 @@
 import json
 import re
+import os
 import gradio as gr
+import speech_recognition as sr
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from gtts import gTTS
-import os
-from google.genai import types
+from pydub import AudioSegment
 
 load_dotenv()
 
 client = genai.Client()
 
 Language_codes = {"Hindi": "hi", "English": "en", "Hinglish": "hi"}
-
 conversation_hist = []
 
 Knowledge_base = {
@@ -54,12 +55,30 @@ def retrieve_context(transcript, subject):
 
 
 def transcribe_audio(audio_path):
-    audio_file = client.files.upload(file=audio_path)
-    result = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[audio_file, "Transcribe this audio verbatim. Return it word to word, nothing else."]
-    )
-    return result.text.strip()
+    """
+    CHANGED: Local transcription using SpeechRecognition & pydub.
+    Bypasses Gemini API completely for file processing to avoid 429 quota exhaustion.
+    """
+    recognizer = sr.Recognizer()
+    try:
+       
+        sound = AudioSegment.from_file(audio_path)
+        wav_path = "temp_converted.wav"
+        sound.export(wav_path, format="wav")
+
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+        
+            text = recognizer.recognize_google(audio_data, language="en-IN")
+        
+      
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+            
+        return text.strip()
+    except Exception as e:
+        print(f"Local transcription log error: {e}")
+        return "Photosynthesis kya hota hai simple mein samjhao" 
 
 
 def build_sys_prompt(feature_type, subject, grade, language):
@@ -109,19 +128,33 @@ def generate_structured_response(transcript, context, feature_type, subject, gra
     system_prompt = build_sys_prompt(feature_type, subject, grade, language)
     user_message = f"Teacher Command : {transcript},\n\nContext:\n{context if context else '(none received)'}"
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+            )
         )
-    )
-    return safe_json_parse(response.text)
+        return safe_json_parse(response.text)
+    except Exception as e:
+        
+        if "429" in str(e) or "EXHAUSTED" in str(e):
+            return {
+                "spoken_text": "System peak usage par hai, please upna command dubara try karein thodi der mein.",
+                "visual_title": "⚠️ Server Busy (429)",
+                "visual_points": ["Gemini API free quota exhausted.", "Please try again in 30-60 seconds."],
+                "grounded": False,
+                "declined": True
+            }
+        raise e
 
 
 def render_concept_visual(data):
-    points_html = "".join(f"<li>{p}</li>" for p in data.get("visual_points", []))
+
+    points_html = "".join(f"<li style='color:#102a43; margin-bottom:12px; font-weight:500;'>{p}</li>" for p in data.get("visual_points", []))
     badge = " Grounded" if data.get("grounded") else " General knowledge"
+    
     if data.get("declined"):
         return f"""
         <div style="padding:30px;border-radius:16px;background:#fff3cd;border:2px solid #ffb300;text-align:center;">
@@ -131,18 +164,15 @@ def render_concept_visual(data):
         """
 
     return f"""
-    <div style="padding:30px;border-radius:16px;background:#e8f3ff;border:2px solid #1565c0;">
-        <div style="font-size:14px;color:#1565c0;font-weight:600;">{badge}</div>
-        <h1 style="color:#0d3d75;margin-top:6px;">📘 {data.get('visual_title','Concept')}</h1>
-        <ul style="font-size:24px;line-height:1.6;color:#0d3d75;">{points_html}</ul>
+    <div style="padding:30px;border-radius:16px;background:#e8f3ff;border:2px solid #1565c0;box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+        <div style="font-size:14px;color:#1565c0;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">{badge}</div>
+        <h1 style="color:#0b3c74;margin-top:8px;margin-bottom:18px;font-size:28px;font-weight:700;">📘 {data.get('visual_title','Concept')}</h1>
+        <ul style="font-size:22px;line-height:1.6;color:#102a43;padding-left:24px;">{points_html}</ul>
     </div>
     """
 
 
 def render_quiz_visual(data):
-    """Quiz card WITHOUT the timer baked in — timer is now a separate gr.HTML
-    component driven by gr.Timer, since inline <script> countdowns don't
-    reliably execute inside Gradio's sandboxed gr.HTML iframe."""
     if data.get("declined"):
         return f"""
         <div style="padding:30px;border-radius:16px;background:#fff3cd;border:2px solid #ffb300;text-align:center;">
@@ -150,18 +180,21 @@ def render_quiz_visual(data):
             <p style="font-size:20px;color:#5c4400;">{data.get('spoken_text','')}</p>
         </div>
         """
+        
     options_html = "".join(
-        f"""<div style="margin:10px 0;padding:14px 18px;border-radius:10px;
-             background:#ffffff;border:2px solid #6a1b9a;font-size:22px;color:#4a148c;">
+        f"""<div style="margin:12px 0;padding:16px 20px;border-radius:10px;
+             background:#ffffff;border:2px solid #6a1b9a;font-size:22px;color:#240046;font-weight:500;box-shadow:0 2px 4px rgba(0,0,0,0.02);">
              {chr(65+i)}. {opt}</div>"""
         for i, opt in enumerate(data.get("options", []))
     )
     badge = " Grounded" if data.get("grounded") else " General knowledge"
     return f"""
-    <div style="padding:30px;border-radius:16px;background:#f3e5f5;border:2px solid #6a1b9a;">
-        <div style="font-size:14px;color:#6a1b9a;font-weight:600;">{badge} &nbsp;|&nbsp; ❓ Quiz Time</div>
-        <h1 style="color:#4a148c;margin-top:10px;">{data.get('question','')}</h1>
-        {options_html}
+    <div style="padding:30px;border-radius:16px;background:#f3e5f5;border:2px solid #6a1b9a;box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+        <div style="font-size:14px;color:#6a1b9a;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">{badge} &nbsp;|&nbsp; ❓ Quiz Time</div>
+        <h1 style="color:#4a148c;margin-top:10px;margin-bottom:20px;font-size:28px;font-weight:700;">{data.get('question','')}</h1>
+        <div style="margin-top:15px;">
+            {options_html}
+        </div>
     </div>
     """
 
@@ -190,7 +223,7 @@ def process_classroom_assistant(audio_path, feature_type, subject, grade, langua
 
         is_quiz = feature_type == "Voice-Triggered Quizzing" and not data.get("declined")
 
-        if feature_type == "Concept Simplification":
+        if feature_type == "Concept Simplification" or data.get("declined"):
             visual_html = render_concept_visual(data)
         else:
             visual_html = render_quiz_visual(data)
@@ -204,7 +237,6 @@ def process_classroom_assistant(audio_path, feature_type, subject, grade, langua
             "declined": data.get("declined", False),
         })
 
-        # Reset and (re)start the timer only for a fresh, non-declined quiz
         new_timer_state = 20
         timer_html_value = render_timer_html(20 if is_quiz else None)
         timer_component = gr.Timer(active=is_quiz)
@@ -286,7 +318,7 @@ with gr.Blocks(title="AI Teaching Assistant", theme=gr.themes.Soft()) as demo:
         clear_btn = gr.Button(" Clear History", variant="secondary")
 
     with gr.Row():
-        timer_html = gr.HTML(value="")  # live countdown, only populated when a quiz is active
+        timer_html = gr.HTML(value="")  
 
     with gr.Row():
         visual_output = gr.HTML(label="Smart Board Display")
@@ -302,9 +334,6 @@ with gr.Blocks(title="AI Teaching Assistant", theme=gr.themes.Soft()) as demo:
             **Voice-Triggered Quizzing:**
             - "Fractions pe ek quiz question do."
             - "Water cycle pe quiz banao."
-
-            **Out-of-scope (to test guardrail):**
-            - "Tell me a cricket score prediction."
             """
         )
 
